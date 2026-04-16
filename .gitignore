@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.Python
+env/
+venv/
+.venv/
+
+# 运行时数据（不上传）
+uploads/
+exports/
+data/ops.log
+data/history.json
+data/undo_history.json
+data/issues.json
+data/operations.log
+data/pending_retries.json
+data/scheduled_retries.json
+data/temp/
+data/*.bak
+data/总排期*.xlsx
+
+# 备份
+*.bak
+*.bak_*
+
+# 打包产物
+dist/
+build/
+*.spec
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 环境变量（含敏感配置）
+.env
+.env.*
+!.env.production.example
