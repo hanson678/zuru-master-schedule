@@ -441,8 +441,8 @@ def write_orders(filepath, orders, export_dir=None):
                         updates.append((COL['inner'], inner_pcs))
                     if outer_qty:
                         updates.append((COL['outer'], outer_qty))
-                    # 总箱：公式=数量÷外箱
-                    updates.append((COL['total_box'], f'=RC{COL["qty"]}/RC{COL["outer"]}', True))
+                    # 总箱：公式=数量÷外箱（外箱=0时留空避免#DIV/0!）
+                    updates.append((COL['total_box'], f'=IF(RC{COL["outer"]}=0,"",RC{COL["qty"]}/RC{COL["outer"]})', True))
                     if customer_po:
                         updates.append((COL['cpo'], customer_po))
                     if line_ship_dt:
@@ -503,14 +503,13 @@ def write_orders(filepath, orders, export_dir=None):
                             n_s = n_s[:-2]
                         if o_s == n_s:
                             continue
-                        # PO号/客PO：纯数字转int + 数值格式0位小数
+                        # PO号/客PO：字符串写入，保留前导零（如客PO 0581402）
                         if col_num in (COL['po'], COL['cpo']):
                             _pv = str(new_val).strip()
-                            if _pv.isdigit():
-                                ws.Cells(r, col_num).Value = int(_pv)
-                                ws.Cells(r, col_num).NumberFormat = '0'
-                            else:
-                                ws.Cells(r, col_num).Value = new_val
+                            if _pv.endswith('.0'):
+                                _pv = _pv[:-2]
+                            ws.Cells(r, col_num).NumberFormat = '@'
+                            ws.Cells(r, col_num).Value = _pv
                         else:
                             ws.Cells(r, col_num).Value = new_val
                         ws.Cells(r, col_num).Interior.Color = BLUE_COM
@@ -651,7 +650,7 @@ def _generate_new_rows_excel(new_rows, output_dir):
             for ci, (key, _) in enumerate(col_order, start=1):
                 val = row_data.get(key, '')
                 if val == '__FORMULA_TOTAL_BOX__':
-                    val = f'={_QTY_COL}{ri}/{_OUTER_COL}{ri}'
+                    val = f'=IF({_OUTER_COL}{ri}=0,"",{_QTY_COL}{ri}/{_OUTER_COL}{ri})'
                 elif val == '__FORMULA_AMOUNT__':
                     val = f'={_QTY_COL}{ri}*{_PRICE_COL}{ri}'
                 elif val == '__FORMULA_AMOUNT_PALLET__':
@@ -664,10 +663,12 @@ def _generate_new_rows_excel(new_rows, output_dir):
                 if key in _DATE_KEYS and val:
                     cell.number_format = 'yyyy/m/d'
                 elif key in ('po', 'cpo') and val:
+                    # 字符串写入，保留前导零（如客PO 0581402）
                     _pv = str(val).strip()
-                    if _pv.replace('.0', '').isdigit():
-                        cell.value = int(float(val))
-                        cell.number_format = '0'
+                    if _pv.endswith('.0'):
+                        _pv = _pv[:-2]
+                    cell.value = _pv
+                    cell.number_format = '@'
 
     wb = openpyxl.Workbook()
 
@@ -689,13 +690,9 @@ def _generate_new_rows_excel(new_rows, output_dir):
                 base = re.match(r'^(.+?)(-S\d+.*)$', item, re.I)
                 base = base.group(1).upper() if base else item.upper()
                 # 查映射
-                locs = sub_map.get(base)
-                if not locs:
-                    num_m = re.match(r'^(\d+)', base)
-                    if num_m:
-                        locs = sub_map.get(num_m.group(1))
+                locs = _find_in_sub_map(sub_map, base)
                 if locs:
-                    sname = locs[0]['sheet']
+                    sname = _best_sheet_name(locs, base)
                     if sname not in grouped:
                         grouped[sname] = []
                     grouped[sname].append(row_data)
@@ -905,7 +902,7 @@ def generate_excel(orders, output_dir):
                 if val == '__FORMULA_TOTAL_BOX__':
                     _qc = openpyxl.utils.get_column_letter({k: i+1 for i, (k,_) in enumerate(col_order)}['qty'])
                     _oc = openpyxl.utils.get_column_letter({k: i+1 for i, (k,_) in enumerate(col_order)}['outer'])
-                    val = f'={_qc}{row_idx}/{_oc}{row_idx}'
+                    val = f'=IF({_oc}{row_idx}=0,"",{_qc}{row_idx}/{_oc}{row_idx})'
                 elif val == '__FORMULA_AMOUNT__':
                     _qc = openpyxl.utils.get_column_letter({k: i+1 for i, (k,_) in enumerate(col_order)}['qty'])
                     _pc = openpyxl.utils.get_column_letter({k: i+1 for i, (k,_) in enumerate(col_order)}['price'])
@@ -921,6 +918,12 @@ def generate_excel(orders, output_dir):
                 cell.alignment = Alignment(vertical='center', wrap_text=(key == 'remark'))
                 if key in ('po_date', 'ship_date', 'insp_date') and val:
                     cell.number_format = 'yyyy/m/d'
+                elif key in ('po', 'cpo') and val:
+                    _pv = str(val).strip()
+                    if _pv.endswith('.0'):
+                        _pv = _pv[:-2]
+                    cell.value = _pv
+                    cell.number_format = '@'
             row_idx += 1
 
     # 列宽
@@ -951,6 +954,46 @@ def generate_excel(orders, output_dir):
 # ── 分排期归属查找（独立于write_orders，纯只读） ──────────────────
 
 _sub_map_cache = {}  # 缓存，避免每次重新加载
+
+def _find_in_sub_map(sub_map, base):
+    """在sub_schedule_map中查找货号，返回locs列表或None
+    查找优先级：1)精确匹配 2)数字前缀 3)base是某个key的前缀（如77896SLT匹配77896SLT-77772）
+    """
+    # 1) 精确匹配
+    if base in sub_map:
+        return sub_map[base]
+    # 2) 数字前缀
+    num_m = re.match(r'^(\d+)', base)
+    if num_m:
+        prefix = num_m.group(1)
+        if prefix in sub_map:
+            return sub_map[prefix]
+    # 3) base是某个key的前缀（如77896SLT → 77896SLT-77772）
+    for k, v in sub_map.items():
+        if k.startswith(base + '-') or k.startswith(base):
+            if k != base:  # 避免重复
+                return v
+    return None
+
+
+def _best_sheet_name(locs, base):
+    """从多个映射中选最佳sheet名：优先sheet名包含货号数字前缀的条目
+    例如 92119 有 [转B版本, 92119, 转B版本]，优先选 '92119'
+    """
+    if not locs:
+        return ''
+    if len(locs) == 1:
+        return locs[0]['sheet']
+    num_m = re.match(r'^(\d+)', base)
+    if num_m:
+        prefix = num_m.group(1)
+        for loc in locs:
+            sname = loc['sheet']
+            # sheet名以货号数字前缀开头（如"92119"、"92119明细"）
+            if sname.startswith(prefix):
+                return sname
+    return locs[0]['sheet']
+
 
 def _load_sub_schedule_map():
     """加载 sub_schedule_map.json"""
@@ -993,18 +1036,10 @@ def lookup_schedule_info(items):
         m = re.match(r'^(.+?)(-S\d+.*)$', raw, re.I)
         base = m.group(1).upper() if m else raw.upper()
 
-        # 1) 精确匹配
-        if base in sub_map:
-            matched[base] = sub_map[base]
+        locs = _find_in_sub_map(sub_map, base)
+        if locs:
+            matched[base] = locs
             continue
-
-        # 2) 数字前缀匹配：取货号的纯数字前缀（如77772）
-        num_prefix = re.match(r'^(\d+)', base)
-        if num_prefix:
-            prefix = num_prefix.group(1)
-            if prefix in sub_map:
-                matched[base] = sub_map[prefix]
-                continue
 
         unmatched.append(base)
 

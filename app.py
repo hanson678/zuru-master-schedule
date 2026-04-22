@@ -6,7 +6,7 @@ from collections import defaultdict
 from flask import Flask, render_template, request, jsonify, send_file
 from excel_po_parser import ExcelPOParser
 from master_schedule import write_orders, generate_excel, DEFAULT_MASTER_PATH, lookup_schedule_info
-from generate_yellow_summary import generate_summary
+from generate_yellow_summary import generate_summary, generate_summary_excel
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, template_folder=os.path.join(APP_DIR, 'templates'),
@@ -190,6 +190,19 @@ def master_schedule_upload():
             'errors': errors, 'warnings': [],
         })
 
+    # 数据异常检测：PDF转Excel可能丢失数据，检测qty/outer为0的行
+    data_warnings = []
+    for od in orders:
+        fname = od.get('filename', '')
+        for ln in od.get('lines', []):
+            sku = ln.get('sku_spec') or ln.get('sku', '')
+            qty = ln.get('qty', 0) or 0
+            outer = ln.get('outer_qty', 0) or 0
+            if qty <= 0:
+                data_warnings.append(f'{fname}: {sku} 数量=0，可能是PDF转Excel时数据丢失，请核对原始PO')
+            elif outer <= 0:
+                data_warnings.append(f'{fname}: {sku} 外箱装箱数=0，可能是PDF转Excel时数据丢失，请核对原始PO')
+
     master_path = _get_master_path()
     export_dir = os.path.join(APP_DIR, 'exports')
     try:
@@ -208,11 +221,17 @@ def master_schedule_upload():
             'dedup_report': dedup_report,
             'ignored_report': ignored_report,
         }
+        if data_warnings:
+            resp['data_warnings'] = data_warnings
         if result.get('export_file'):
             resp['export_file'] = result['export_file']
         # 分排期归属查找（纯附加信息，不影响主流程）
         try:
-            all_items = [o.get('sku_spec', '') for o in orders if o.get('sku_spec')]
+            all_items = []
+            for o in orders:
+                for ln in o.get('lines', []):
+                    s = ln.get('sku_spec', '') or ln.get('sku', '')
+                    if s: all_items.append(s)
             sch_info = lookup_schedule_info(all_items)
             resp['schedule_info'] = sch_info
         except Exception:
@@ -255,7 +274,7 @@ def _get_master_path():
 
 @app.route('/api/yellow-summary', methods=['POST'])
 def yellow_summary():
-    """扫描总排期黄色行，生成分排期汇总sheet"""
+    """扫描总排期有填充行汇总"""
     mp = _get_master_path()
     try:
         result = generate_summary(mp)
@@ -264,6 +283,21 @@ def yellow_summary():
         return jsonify({'error': str(e)}), 500
     except Exception as e:
         return jsonify({'error': f'生成汇总失败: {e}'}), 500
+
+
+@app.route('/api/yellow-summary-download', methods=['POST'])
+def yellow_summary_download():
+    """生成有填充行汇总Excel并下载"""
+    mp = _get_master_path()
+    export_dir = os.path.join(APP_DIR, 'exports')
+    try:
+        fname = generate_summary_excel(mp, export_dir)
+        if not fname:
+            return jsonify({'error': '无整行填充行，无法生成'}), 400
+        filepath = os.path.join(export_dir, fname)
+        return send_file(filepath, as_attachment=True, download_name=fname)
+    except Exception as e:
+        return jsonify({'error': f'生成汇总Excel失败: {e}'}), 500
 
 
 @app.route('/api/master-schedule-info')

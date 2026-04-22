@@ -143,6 +143,13 @@ async function doUpload() {
                 });
                 html += `</div>`;
             }
+            // 数据异常警告（PDF转Excel丢失数据）
+            if (data.data_warnings && data.data_warnings.length) {
+                html += `<div class="alert alert-danger mb-2" style="border-left:4px solid #dc3545;font-weight:bold;">`;
+                html += `<i class="bi bi-exclamation-octagon me-1"></i><b>数据异常（可能PDF转Excel丢失数据，请核对原始PO）：</b><br>`;
+                data.data_warnings.forEach(w => { html += `<span style="color:#dc3545;">${_escHtml(w)}</span><br>`; });
+                html += `</div>`;
+            }
             // 备注缺失警告
             if (data.warnings && data.warnings.length) {
                 html += `<div class="alert alert-danger mb-2"><i class="bi bi-exclamation-triangle me-1"></i><b>备注警告：</b><br>`;
@@ -184,7 +191,6 @@ async function doUpload() {
                 const mKeys = Object.keys(matched);
                 if (mKeys.length > 0 || unmatched.length > 0) {
                     html += `<hr><div class="mb-2"><b><i class="bi bi-diagram-3 me-1"></i>分排期归属：</b></div>`;
-                    // 按文件分组展示
                     const byFile = {};
                     mKeys.forEach(item => {
                         matched[item].forEach(loc => {
@@ -206,7 +212,6 @@ async function doUpload() {
                         });
                         html += `</div>`;
                     });
-                    // 未识别货号
                     if (unmatched.length > 0) {
                         html += `<div class="mt-1" style="font-size:0.85rem;"><span class="text-warning"><i class="bi bi-question-circle me-1"></i>未识别归属：</span>`;
                         unmatched.forEach(it => { html += `<span class="badge bg-warning text-dark me-1">${_escHtml(it)}</span>`; });
@@ -247,10 +252,10 @@ async function doYellowSummary() {
         } else if (data.total === 0) {
             content.innerHTML = `<div class="alert alert-info">未发现整行填充的行</div>`;
         } else {
-            let html = `<div class="alert alert-success mb-2 py-2"><i class="bi bi-check-circle me-1"></i>`;
+            let html = `<div class="alert alert-success mb-2 py-2 d-flex justify-content-between align-items-center"><div><i class="bi bi-check-circle me-1"></i>`;
             html += `共 <b>${data.total}</b> 行整行填充，分布在 <b>${data.group_count}</b> 个分排期sheet`;
             if (data.unmatched && data.unmatched.length > 0) html += `，<span class="text-warning fw-bold">${data.unmatched.length} 个货号未匹配</span>`;
-            html += `</div>`;
+            html += `</div><button class="btn btn-primary btn-sm ms-2" onclick="doDownloadSummary()"><i class="bi bi-download me-1"></i>下载Excel</button></div>`;
             // 分组表格
             html += `<div style="max-height:500px;overflow-y:auto;">`;
             html += `<table class="table table-sm table-bordered" style="font-size:0.82rem;">`;
@@ -262,7 +267,7 @@ async function doYellowSummary() {
                     html += ii === 0 ? `<td rowspan="${g.items.length+1}">${_escHtml(g.file)}</td><td rowspan="${g.items.length+1}">${_escHtml(g.sheet)}</td>` : '';
                     html += `<td><b>${_escHtml(it.item)}</b></td><td>${_escHtml(it.cn_name)}</td><td class="text-center">${it.count}</td><td class="text-end">${it.qty_sum ? it.qty_sum.toLocaleString() : ''}</td><td></td></tr>`;
                 });
-                html += `<tr class="table-warning fw-bold"><td colspan="4" class="text-end">小计</td><td class="text-center">${g.total}</td></tr>`;
+                html += `<tr class="table-warning fw-bold"><td colspan="4" class="text-end">小计</td><td class="text-center">${g.total}</td><td></td><td></td></tr>`;
             });
             // 未匹配
             if (data.unmatched && data.unmatched.length) {
@@ -281,6 +286,29 @@ async function doYellowSummary() {
     }
     btn.disabled = false;
     btn.innerHTML = '<i class="bi bi-bar-chart me-1"></i>有填充行汇总';
+}
+
+async function doDownloadSummary() {
+    try {
+        const resp = await fetch('/api/yellow-summary-download', {method:'POST'});
+        if (!resp.ok) {
+            const d = await resp.json();
+            alert(d.error || '下载失败');
+            return;
+        }
+        const blob = await resp.blob();
+        const cd = resp.headers.get('content-disposition') || '';
+        let fname = '有填充行汇总.xlsx';
+        const m = cd.match(/filename\*?=(?:UTF-8'')?([^;]+)/i);
+        if (m) fname = decodeURIComponent(m[1].replace(/"/g,''));
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = fname;
+        a.click();
+        URL.revokeObjectURL(a.href);
+    } catch(e) {
+        alert('下载失败: ' + e.message);
+    }
 }
 
 async function checkStatus() {
