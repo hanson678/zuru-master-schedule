@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title ZURU 总排期入单系统
+title ZURU 排期录入系统
 cd /d "%~dp0"
 
 REM ===== 自动查找Python =====
@@ -54,7 +54,7 @@ if exist requirements.txt (
 )
 
 REM ===== 读取端口配置 =====
-set "PORT=5003"
+set "PORT=5000"
 if exist "data\config.json" (
     for /f "tokens=2 delims=:, " %%a in ('findstr "port" "data\config.json" 2^>nul') do (
         set "PORT=%%~a"

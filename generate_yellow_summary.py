@@ -158,6 +158,11 @@ def _group_by_schedule(filled_rows, sub_map):
             num_m = re.match(r'^(\d+)', base)
             if num_m:
                 locs = sub_map.get(num_m.group(1))
+        if not locs:
+            # M开头货号fallback: MXXX-9298-2025 → 9298-2025, MXXX-9298 → 9298
+            m_match = re.match(r'^M[A-Z0-9]+-(\d+(?:-\d{4})?)$', base, re.I)
+            if m_match:
+                locs = sub_map.get(m_match.group(1))
         if locs:
             loc = locs[0]
             key = (loc['file'], loc['sheet'])

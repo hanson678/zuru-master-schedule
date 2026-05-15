@@ -295,7 +295,7 @@ class ExcelPOParser:
         用制表符分隔单元格，避免与_parse_header正则中的\\s{2,}终止条件冲突
         （如Customer Name后的'COOP FAGHANDEL'被两空格截断为'COOP'）"""
         rows_text = []
-        for row in ws.iter_rows(max_col=30, max_row=500):
+        for row in ws.iter_rows(max_col=50, max_row=500):
             cells = []
             for c in row:
                 v = c.value
@@ -369,13 +369,13 @@ class ExcelPOParser:
             'sales_order': f(r'Sales\s+Order#?[:\s]*(\d+)'),
             'destination': dest_raw,
             # dest_raw为空时，尝试从客户名推断国家（如"ZURU FRANCE" → "France"）
-            'destination_cn': _country_cn(dest_raw) or _country_cn(
-                re.sub(r'^.*?\b(France|Germany|Spain|Italy|Australia|Japan|Korea|'
-                       r'Canada|Mexico|Brazil|Poland|Netherlands|Portugal|'
-                       r'Sweden|Norway|Denmark|Finland|Belgium|Austria|Switzerland|'
-                       r'United\s+Kingdom|UK|USA|United\s+States)\b.*$',
-                       r'\1', customer or '', flags=re.I)
-                if customer else ''),
+            'destination_cn': _country_cn(dest_raw) or (lambda _m: _country_cn(_m.group(1)) if _m else '')(
+                re.search(r'\b(France|Germany|Spain|Italy|Australia|Japan|Korea|'
+                          r'Canada|Mexico|Brazil|Poland|Netherlands|Portugal|'
+                          r'Sweden|Norway|Denmark|Finland|Belgium|Austria|Switzerland|'
+                          r'United\s+Kingdom|UK|USA|United\s+States|Panama|'
+                          r'New\s+Zealand|Colombia|Peru|Chile|Argentina)',
+                          customer or '', flags=re.I)),
             'loading_port': f(r'Loading\s+Port[:\s]*(.+?)(?:\t|\n)'),
         }
 
@@ -441,7 +441,7 @@ class ExcelPOParser:
                     prev_row_vals = []
                     if header_row > 1:
                         try:
-                            prev_row = list(ws.iter_rows(min_row=header_row - 1, max_row=header_row - 1, max_col=30))
+                            prev_row = list(ws.iter_rows(min_row=header_row - 1, max_row=header_row - 1, max_col=50))
                             if prev_row:
                                 prev_row_vals = [str(c.value or '').strip().upper() for c in prev_row[0]]
                         except:
@@ -717,8 +717,8 @@ class ExcelPOParser:
         sections = {}  # label -> [content lines]
 
         for row in ws.iter_rows(max_row=600):
-            # A列标签
-            a_val = str(row[0].value or '').strip() if row else ''
+            # A列标签（规范化：多个连续空格合并为单个，兼容Excel双空格如"Tracking  Code:"）
+            a_val = re.sub(r'\s+', ' ', str(row[0].value or '')).strip() if row else ''
 
             # 停止：遇到 Order Modifiable Records
             if 'Order Modifiable' in a_val:
@@ -763,7 +763,16 @@ class ExcelPOParser:
                 sections[current_label] = current_parts
             elif re.match(r'Remark', a_val, re.I) and current_label:
                 current_label = 'remark'
-                current_parts = [content] if content else []
+                # A列可能同时包含标签+内容（如 "Remark: 外箱材质..."），提取冒号后文本
+                a_content = re.sub(r'^Remark\s*[:：]\s*', '', a_val, flags=re.I).strip()
+                if a_content and content:
+                    current_parts = [a_content + '\n' + content]
+                elif a_content:
+                    current_parts = [a_content]
+                elif content:
+                    current_parts = [content]
+                else:
+                    current_parts = []
                 sections[current_label] = current_parts
             elif current_label and not a_val and content:
                 # 续行：A列为空，内容列有值

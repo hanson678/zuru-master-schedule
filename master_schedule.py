@@ -131,6 +131,15 @@ def _item_base(sku):
     return m.group(1).upper() if m else ''
 
 
+def _lookup_cn(cn_names, sku):
+    """查中文名：先按完整货号精确匹配，再fallback基础码"""
+    full = re.sub(r'[\s\n]+', '', str(sku).strip()).upper()
+    if full in cn_names:
+        return cn_names[full]
+    base = _item_base(full)
+    return cn_names.get(base, '') if base else ''
+
+
 def _normalize_po(v):
     """PO号标准化：去掉.0后缀、去空白"""
     s = str(v or '').strip()
@@ -145,13 +154,13 @@ _HY_PREFIXES = {'15746','15749','15751','15754','15755','15760',
 
 
 def _is_fuggler(sku):
-    """判断是否Fuggler系列（157开头 或 125160/125169）"""
+    """判断是否Fuggler系列（157开头），验货期-2天"""
     s = re.sub(r'[\s\n]+', '', str(sku or '')).upper()
     base = re.match(r'(\d+)', s)
     if not base:
         return False
     num = base.group(1)
-    return num.startswith('157') or num.startswith('125160') or num.startswith('125169')
+    return num.startswith('157')
 
 
 def _is_hy(sku):
@@ -202,12 +211,15 @@ def _date_serial(dt):
 def _build_index(filepath):
     """用openpyxl只读扫描总排期，建立：
     1. (PO+货号+line_no)→行号 的匹配索引
-    2. 货号基础码→中文名 的中文名索引（取最后出现的，即最新）
+    2. 中文名索引：完整货号→中文名 + 基础码→中文名(最多出现的)
     Returns: index_dict, cn_name_dict, max_row
     """
     import openpyxl
+    from collections import Counter
     index = {}       # (po, item_upper, sku_line) → row
-    cn_names = {}    # item_base_upper → cn_name（取最后出现的）
+    cn_names = {}    # 完整货号/基础码 → cn_name
+    _cn_base_counter = {}  # 基础码 → Counter({中文名: 出现次数})
+    two_key_count = {}  # (po, item) → 出现次数，用于判断二元组是否唯一
     max_row = 1
     try:
         wb = openpyxl.load_workbook(filepath, data_only=True, read_only=True)
@@ -232,14 +244,29 @@ def _build_index(filepath):
                 key = (po_val, item_val, sku_line)
                 index[key] = r
                 key2 = (po_val, item_val)
+                two_key_count[key2] = two_key_count.get(key2, 0) + 1
                 if key2 not in index:
                     index[key2] = r
 
-            # 中文名索引：按货号基础码存最后出现的有效中文名
+            # 中文名索引：按完整货号精确存储 + 基础码统计出现次数
             if item_val and cn_val and any('\u4e00' <= c <= '\u9fff' for c in cn_val):
+                cn_names[item_val] = cn_val  # 完整货号精确匹配
                 base = _item_base(item_val)
                 if base:
-                    cn_names[base] = cn_val
+                    if base not in _cn_base_counter:
+                        _cn_base_counter[base] = Counter()
+                    _cn_base_counter[base][cn_val] += 1
+
+        # 基础码取出现次数最多的中文名作为fallback（不覆盖已有的完整货号条目）
+        for base, counter in _cn_base_counter.items():
+            if base not in cn_names:
+                cn_names[base] = counter.most_common(1)[0][0]
+
+        # 同一(PO,货号)出现多行时，删除二元组索引避免错误兜底
+        for key2, cnt in two_key_count.items():
+            if cnt > 1 and key2 in index:
+                del index[key2]
+
         wb.close()
     except Exception as e:
         logging.warning(f'[总排期索引] 构建失败: {e}')
@@ -266,7 +293,7 @@ def _search_cn_name_com(ws, sku_spec, insert_row, max_row):
     return ''
 
 
-def write_orders(filepath, orders, export_dir=None):
+def write_orders(filepath, orders, export_dir=None, ignored_orders=None):
     """修改单用WPS COM写入总排期，新单生成到独立Excel供复制粘贴
 
     Returns: {'ok': bool, 'modified': int, 'new_count': int, 'msg': str, 'export_file': str}
@@ -426,10 +453,19 @@ def write_orders(filepath, orders, export_dir=None):
                 f_sku = f"{po}-{line_no}" if po and line_no else ''
                 item_upper = re.sub(r'[\s\n]+', '', str(sku_spec)).strip().upper()
 
-                # 索引查找：先三元组，再二元组兜底
+                # 索引查找：先三元组，再二元组，最后截取到-S00x兜底
                 existing_row = index.get((po, item_upper, f_sku))
                 if not existing_row:
                     existing_row = index.get((po, item_upper))
+                if not existing_row:
+                    # 第三层兜底：货号可能粘连了产品描述（如77889SLT-S001-PRODBC）
+                    # 截取到 -S00x 部分再匹配
+                    _trunc = re.match(r'(.+-S\d+)', item_upper)
+                    if _trunc:
+                        _item_trunc = _trunc.group(1)
+                        existing_row = index.get((po, _item_trunc))
+                        if existing_row:
+                            logging.info(f'[索引匹配] 基础码兜底: {item_upper} -> {_item_trunc}')
                 logging.info(f'[索引匹配] po={po} item={item_upper} f_sku={f_sku} '
                              f'-> row={existing_row or "未找到(新单)"}')
 
@@ -532,7 +568,7 @@ def write_orders(filepath, orders, export_dir=None):
                         logging.info(f'[总排期修改] row={r} PO={po} SKU={sku_spec} 变化: {", ".join(changed_fields)}')
                 else:
                     # ========== 新单 → 收集到列表（不写入Z盘）==========
-                    cn_name = cn_names.get(_item_base(sku_spec), '')
+                    cn_name = _lookup_cn(cn_names, sku_spec)
                     # 接单日期转datetime
                     po_date_dt = None
                     if po_date:
@@ -561,10 +597,56 @@ def write_orders(filepath, orders, export_dir=None):
             wb.Save()
             logging.info(f'[总排期] 修改{mod_count}行已保存')
 
+        # 组装黑名单行数据（与new_rows相同格式）
+        ignored_rows = []
+        if ignored_orders:
+            for order in ignored_orders:
+                header = order.get('header') or order
+                _po = _normalize_po(header.get('po_number', '') or order.get('po_number', ''))
+                _po_date = header.get('po_date', '') or order.get('po_date', '')
+                _customer = header.get('customer', '') or order.get('customer', '')
+                _dest = header.get('destination_cn', '') or order.get('destination_cn', '')
+                _from = header.get('from_person', '') or order.get('from_person', '')
+                for ln in order.get('lines', []):
+                    _sku = ln.get('sku_spec', '') or ln.get('sku', '')
+                    _qty = ln.get('qty', 0) or 0
+                    _price = ln.get('price', 0) or 0
+                    _inner = ln.get('inner_pcs', 0) or 0
+                    _outer = ln.get('outer_qty', 0) or 0
+                    _cpo = ln.get('customer_po', '')
+                    _line_no = ln.get('line_no', '')
+                    _f_sku = f"{_po}-{_line_no}" if _po and _line_no else ''
+                    _ship = ln.get('delivery', '') or header.get('ship_date', '') or order.get('ship_date', '')
+                    _ship_dt = None
+                    if _ship:
+                        try:
+                            _ship_dt = datetime.strptime(str(_ship)[:10], '%Y-%m-%d')
+                        except Exception:
+                            pass
+                    _po_date_dt = None
+                    if _po_date:
+                        try:
+                            _po_date_dt = datetime.strptime(str(_po_date)[:10], '%Y-%m-%d')
+                        except Exception:
+                            pass
+                    ignored_rows.append({
+                        'po_date': _po_date_dt, 'customer': _customer, 'dest': _dest,
+                        'po': _po, 'cpo': _cpo, 'sku_line': _f_sku,
+                        'item': _sku, 'cn_name': _lookup_cn(cn_names, _sku),
+                        'qty': _qty, 'inner': _inner, 'outer': _outer,
+                        'total_box': '__FORMULA_TOTAL_BOX__',
+                        'ship_date': _ship_dt, 'insp_date': _calc_inspection(_ship_dt, _sku),
+                        'remark': '',
+                        'from_person': _from.strip() if _from else '',
+                        'price': round(_price, 4) if _price else '',
+                        'amount': '__FORMULA_AMOUNT__',
+                    })
+
         # 新单生成到独立Excel
         export_file = ''
-        if new_rows and export_dir:
-            export_file = _generate_new_rows_excel(new_rows, export_dir)
+        if (new_rows or ignored_rows) and export_dir:
+            export_file = _generate_new_rows_excel(new_rows, export_dir,
+                                                   ignored_rows=ignored_rows)
 
         parts = []
         if mod_count: parts.append(f'修改{mod_count}行(已写入总排期)')
@@ -593,9 +675,10 @@ def write_orders(filepath, orders, export_dir=None):
         pythoncom.CoUninitialize()
 
 
-def _generate_new_rows_excel(new_rows, output_dir):
+def _generate_new_rows_excel(new_rows, output_dir, ignored_rows=None):
     """把新单数据生成为格式化Excel，按分排期sheet分组
-    第一个sheet"新单数据"放全部行，后续sheet按分排期sheet名分组"""
+    第一个sheet"新单数据"放全部行，后续sheet按分排期sheet名分组
+    ignored_rows不为空时额外生成"黑名单"sheet"""
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
@@ -720,6 +803,16 @@ def _generate_new_rows_excel(new_rows, output_dir):
     except Exception as e:
         logging.warning(f'[新单Excel] 分排期分组失败（不影响主sheet）: {e}')
 
+    # ── 黑名单sheet：被忽略的货号行 ──
+    if ignored_rows:
+        try:
+            ws_ig = wb.create_sheet(title='黑名单')
+            _write_header(ws_ig)
+            _write_rows(ws_ig, ignored_rows)
+            logging.info(f'[新单Excel] 黑名单sheet: {len(ignored_rows)}行')
+        except Exception as e:
+            logging.warning(f'[新单Excel] 黑名单sheet生成失败: {e}')
+
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     os.makedirs(output_dir, exist_ok=True)
     fname = f'总排期新单_{ts}.xlsx'
@@ -758,7 +851,7 @@ def generate_excel(orders, output_dir):
         if os.path.exists(cn_path):
             with open(cn_path, 'r', encoding='utf-8') as f:
                 raw = json.load(f)
-            cn_map = {k: v.get('cn_name', '') if isinstance(v, dict) else str(v)
+            cn_map = {k.upper(): v.get('cn_name', '') if isinstance(v, dict) else str(v)
                       for k, v in raw.items() if not k.startswith('_')}
     except Exception:
         pass
@@ -863,7 +956,7 @@ def generate_excel(orders, output_dir):
             insp_dt = _calc_inspection(line_ship_dt, sku_spec)
 
             f_sku = f"{po}-{line_no}" if po and line_no else ''
-            cn_name = cn_map.get(_item_base(sku_spec), '')
+            cn_name = _lookup_cn(cn_map, sku_spec)
 
             # 接单日期转datetime
             po_date_dt = None

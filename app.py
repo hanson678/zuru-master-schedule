@@ -51,17 +51,19 @@ def _load_ignore_items():
 
 def _filter_ignored(orders):
     """按货号数字前缀匹配黑名单，命中的行从orders中移除
-    返回 (过滤后orders, 忽略报告)
+    返回 (过滤后orders, 忽略报告, 忽略行的完整orders列表)
     报告格式: [{'item': '15790', 'count': 3, 'source': 'PO-xxx.xlsx'}]
     lines全空的order会被整体丢弃
     """
     ignore_set = _load_ignore_items()
     if not ignore_set:
-        return orders, []
+        return orders, [], []
     report = []
     new_orders = []
+    ignored_orders = []  # 保留被忽略行的完整order结构
     for od in orders:
         kept_lines = []
+        ignored_lines = []
         ignored_count = {}
         for ln in od.get('lines', []):
             sku = ln.get('sku_spec') or ln.get('sku', '')
@@ -69,6 +71,7 @@ def _filter_ignored(orders):
             prefix = num_m.group(1).upper() if num_m else ''
             if prefix and prefix in ignore_set:
                 ignored_count[prefix] = ignored_count.get(prefix, 0) + 1
+                ignored_lines.append(ln)
                 continue
             kept_lines.append(ln)
         for item, cnt in ignored_count.items():
@@ -78,12 +81,17 @@ def _filter_ignored(orders):
                 'source': od.get('filename', ''),
             })
             logging.info(f'[黑名单忽略] {od.get("filename","")}: 货号{item} x {cnt}行')
+        if ignored_lines:
+            # 复制order header，替换lines为被忽略的行
+            ig_od = dict(od)
+            ig_od['lines'] = ignored_lines
+            ignored_orders.append(ig_od)
         if kept_lines:
             od['lines'] = kept_lines
             new_orders.append(od)
         else:
             logging.info(f'[黑名单忽略] {od.get("filename","")}: 所有行都在黑名单，整单丢弃')
-    return new_orders, report
+    return new_orders, report, ignored_orders
 
 
 def _extract_revision(filename):
@@ -178,7 +186,7 @@ def master_schedule_upload():
     orders, dedup_report = _dedup_orders(orders)
 
     # 黑名单过滤：特定货号不入排期
-    orders, ignored_report = _filter_ignored(orders)
+    orders, ignored_report, ignored_orders = _filter_ignored(orders)
     if not orders:
         return jsonify({
             'ok': True,
@@ -206,7 +214,8 @@ def master_schedule_upload():
     master_path = _get_master_path()
     export_dir = os.path.join(APP_DIR, 'exports')
     try:
-        result = write_orders(master_path, orders, export_dir=export_dir)
+        result = write_orders(master_path, orders, export_dir=export_dir,
+                              ignored_orders=ignored_orders)
         if not result['ok']:
             return jsonify({'error': result['msg']}), 500
         resp = {
@@ -321,30 +330,129 @@ def master_schedule_info():
 
 @app.route('/api/master-schedule-set-path', methods=['POST'])
 def master_schedule_set_path():
-    """切换总排期文件路径"""
+    """切换总排期文件路径（只接受.xlsx文件）"""
     new_path = request.json.get('path', '').strip()
     if not new_path:
         _custom_path['path'] = ''
         return jsonify({'ok': True, 'path': DEFAULT_MASTER_PATH, 'msg': '已恢复默认Z盘路径'})
     if not os.path.exists(new_path):
         return jsonify({'error': f'路径不存在: {new_path}'}), 400
-    # 如果输入的是文件夹，自动找里面的xlsx文件
-    if os.path.isdir(new_path):
-        xlsx_files = [f for f in os.listdir(new_path)
-                      if f.endswith('.xlsx') and not f.startswith('~$')]
-        if not xlsx_files:
-            return jsonify({'error': f'文件夹内没有xlsx文件: {new_path}'}), 400
-        if len(xlsx_files) == 1:
-            new_path = os.path.join(new_path, xlsx_files[0])
-        else:
-            # 优先找含"总"的文件
-            master_files = [f for f in xlsx_files if '总' in f]
-            if master_files:
-                new_path = os.path.join(new_path, master_files[0])
-            else:
-                new_path = os.path.join(new_path, xlsx_files[0])
+    if not new_path.lower().endswith('.xlsx'):
+        return jsonify({'error': '请选择.xlsx文件'}), 400
     _custom_path['path'] = new_path
     return jsonify({'ok': True, 'path': new_path, 'msg': f'已切换到: {new_path}'})
+
+
+@app.route('/api/ignore-items', methods=['GET'])
+def get_ignore_items():
+    """获取黑名单列表"""
+    p = os.path.join(APP_DIR, 'data', 'ignore_items.json')
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return jsonify({'items': data.get('ignore_items', [])})
+    except Exception as e:
+        return jsonify({'items': [], 'error': str(e)})
+
+
+@app.route('/api/ignore-items', methods=['POST'])
+def update_ignore_items():
+    """更新黑名单列表"""
+    items = request.json.get('items', [])
+    # 清洗：去空白、去重、纯数字排序
+    cleaned = sorted(set(str(x).strip() for x in items if str(x).strip()),
+                     key=lambda x: int(x) if x.isdigit() else float('inf'))
+    p = os.path.join(APP_DIR, 'data', 'ignore_items.json')
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data['ignore_items'] = cleaned
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    # 清除缓存让下次加载生效
+    _ignore_cache['mtime'] = None
+    return jsonify({'ok': True, 'items': cleaned, 'count': len(cleaned)})
+
+
+@app.route('/api/dual-map', methods=['GET'])
+def get_dual_map():
+    """获取双排期货号映射"""
+    p = os.path.join(APP_DIR, 'data', 'dual_schedule_map.json')
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # 过滤掉_开头的说明字段
+        items = {k: v for k, v in data.items() if not k.startswith('_')}
+        return jsonify({'items': items})
+    except Exception as e:
+        return jsonify({'items': {}, 'error': str(e)})
+
+
+@app.route('/api/dual-map', methods=['POST'])
+def update_dual_map():
+    """更新双排期货号映射"""
+    items = request.json.get('items', {})
+    p = os.path.join(APP_DIR, 'data', 'dual_schedule_map.json')
+    # 保留原有的_说明字段
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    meta = {k: v for k, v in data.items() if k.startswith('_')}
+    meta.update(items)
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    # 刷新内存缓存
+    from master_schedule import _load_dual_map, _DUAL_MAP
+    import master_schedule
+    master_schedule._DUAL_MAP = _load_dual_map()
+    return jsonify({'ok': True, 'count': len(items)})
+
+
+@app.route('/api/master-schedule-upload-file', methods=['POST'])
+def master_schedule_upload_file():
+    """上传总排期文件（本地Excel上传到服务器使用）"""
+    if 'file' not in request.files:
+        return jsonify({'error': '未选择文件'}), 400
+    f = request.files['file']
+    if not f.filename or not f.filename.lower().endswith(('.xlsx', '.xls')):
+        return jsonify({'error': '请选择 .xlsx 或 .xls 文件'}), 400
+    save_path = os.path.join(APP_DIR, 'data', 'uploaded_master.xlsx')
+    try:
+        f.save(save_path)
+    except Exception as e:
+        return jsonify({'error': f'保存失败: {e}'}), 500
+    _custom_path['path'] = save_path
+    return jsonify({'ok': True, 'path': save_path, 'msg': f'已上传并切换到: {f.filename}'})
+
+
+@app.route('/api/browse-directory', methods=['POST'])
+def browse_directory():
+    """浏览目录，返回子目录和xlsx文件列表"""
+    dir_path = os.path.normpath(request.json.get('path', '').strip()) if request.json.get('path', '').strip() else ''
+    if not dir_path:
+        # 默认起始目录：总排期所在文件夹
+        dir_path = os.path.dirname(DEFAULT_MASTER_PATH)
+    if not os.path.exists(dir_path) or not os.path.isdir(dir_path):
+        return jsonify({'error': f'目录不存在: {dir_path}'}), 400
+    try:
+        entries = os.listdir(dir_path)
+    except PermissionError:
+        return jsonify({'error': f'无权访问: {dir_path}'}), 403
+    dirs = sorted([e for e in entries if os.path.isdir(os.path.join(dir_path, e))
+                   and not e.startswith('.')])
+    files = sorted([e for e in entries if e.lower().endswith('.xlsx')
+                    and not e.startswith('~$')])
+    parent = os.path.dirname(dir_path)
+    return jsonify({
+        'current': dir_path,
+        'parent': parent if parent != dir_path else '',
+        'dirs': dirs,
+        'files': files,
+    })
 
 
 if __name__ == '__main__':

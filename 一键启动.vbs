@@ -42,7 +42,7 @@ If pythonExe = "" Then
 End If
 
 ' ===== 读取端口配置 =====
-port = "5003"
+port = "5000"
 cfgFile = scriptDir & "\data\config.json"
 If fso.FileExists(cfgFile) Then
     Set f = fso.OpenTextFile(cfgFile, 1, False, -1)
