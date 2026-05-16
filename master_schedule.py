@@ -99,9 +99,15 @@ def _expand_dual_items(lines):
     result = []
     for ln in lines:
         sku_spec = ln.get('sku_spec', '') or ln.get('sku', '')
-        base = re.match(r'(\d+)', str(sku_spec).strip())
+        _sku_s = str(sku_spec).strip().upper()
+        # 提取数字前缀（如77896）和完整前缀（如MEC426，去掉-S00x及后续）
+        base = re.match(r'(\d+)', _sku_s)
         base_num = base.group(1) if base else ''
+        full_prefix = re.match(r'([A-Z]*\d+[A-Z]*)', _sku_s)
+        full_key = full_prefix.group(1) if full_prefix else ''
         cfg = dual_map.get(base_num) if base_num else None
+        if not cfg and full_key:
+            cfg = dual_map.get(full_key)
         if not cfg:
             result.append(ln)
             continue
