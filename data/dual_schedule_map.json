@@ -11,5 +11,6 @@
   "92123": {"targets": ["9298", "92104"], "mode": "append"},
   "92124": {"targets": ["9298", "92104", "92119"], "mode": "append"},
   "92149": {"targets": ["92119", "92129"], "mode": "none"},
-  "MEC426": {"targets": ["77772", "77794"], "mode": "s_insert"}
+  "MEC426": {"targets": ["77772", "77794"], "mode": "s_insert"},
+  "MEC305": {"targets": ["77673", "77711"], "mode": "append"}
 }
